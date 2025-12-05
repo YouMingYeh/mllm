@@ -1,0 +1,8 @@
+data/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+evaluation_report.*
+.env
+.venv/
+.DS_Store
