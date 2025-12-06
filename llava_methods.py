@@ -13,6 +13,10 @@ IMAGE_RESOLUTION = 336
 IMAGE_TOKEN_INDEX = 32000
 ATT_LAYER = 14
 
+# CLS attention layer for token pruning (based on FasterVLM research)
+# Last ViT layer typically has most semantic information
+VIT_CLS_LAYER = -1  # Use last layer's CLS attention
+
 def gradient_attention_llava(image, prompt, general_prompt, model, processor):
     """
     Generates an attention map using gradient-weighted attention from LLaVA model.
@@ -33,7 +37,7 @@ def gradient_attention_llava(image, prompt, general_prompt, model, processor):
                 the gradient-weighted attention map
     """
     # Prepare inputs
-    inputs = processor(prompt, image, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
+    inputs = processor(images=image, text=prompt, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
     pos = inputs['input_ids'][0].tolist().index(IMAGE_TOKEN_INDEX)
     
     # Compute loss
@@ -73,14 +77,14 @@ def rel_attention_llava(image, prompt, general_prompt, model, processor):
                 the relative attention map (specific/general)
     """
     # Prepare inputs for the prompt
-    inputs = processor(prompt, image, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
+    inputs = processor(images=image, text=prompt, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
     pos = inputs['input_ids'][0].tolist().index(IMAGE_TOKEN_INDEX)
 
     # Compute attention map for the 14th layer
     att_map = model(**inputs, output_attentions=True)['attentions'][ATT_LAYER][0, :, -1, pos:pos+NUM_IMG_TOKENS].mean(dim=0).to(torch.float32).detach().cpu().numpy().reshape(NUM_PATCHES, NUM_PATCHES)
 
     # Prepare inputs for the general prompt
-    general_inputs = processor(general_prompt, image, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
+    general_inputs = processor(images=image, text=general_prompt, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
     general_pos = general_inputs['input_ids'][0].tolist().index(IMAGE_TOKEN_INDEX)
 
     # Compute general attention map for the 14th layer
@@ -110,8 +114,8 @@ def pure_gradient_llava(image, prompt, general_prompt, model, processor):
               regions relevant to the specific prompt
     """
     # Process inputs
-    inputs = processor(prompt, image, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
-    general_inputs = processor(general_prompt, image, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
+    inputs = processor(images=image, text=prompt, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
+    general_inputs = processor(images=image, text=general_prompt, return_tensors="pt", padding=True).to(model.device, torch.bfloat16)
     
     # Apply high pass filter
     high_pass = high_pass_filter(image, IMAGE_RESOLUTION, reduce=False)
@@ -154,5 +158,93 @@ def pure_gradient_llava(image, prompt, general_prompt, model, processor):
     
     # Reduce gradient block size
     grad = block_reduce(grad, block_size=(PATCH_SIZE, PATCH_SIZE), func=np.mean)
-    
+
     return grad
+
+
+def cls_attention_llava(image, prompt, general_prompt, model, processor):
+    """
+    Extract CLS token attention from ViT encoder for token importance scoring.
+
+    Based on FasterVLM research: CLS attention from ViT is more reliable than
+    LLM text-visual attention for identifying important visual tokens.
+    Key insight: CLS token learns to aggregate important visual information,
+    making it a natural importance estimator.
+
+    Args:
+        image: Input PIL image
+        prompt: Text prompt (not used, kept for API consistency)
+        general_prompt: General prompt (not used, kept for API consistency)
+        model: LLaVA model instance
+        processor: LLaVA processor
+
+    Returns:
+        att_map: 2D numpy array (NUM_PATCHES x NUM_PATCHES) of CLS attention weights
+    """
+    device = model.device
+
+    # Process image through the vision tower
+    inputs = processor(images=image, text="<image>\nUSER: Describe.\nASSISTANT:",
+                       return_tensors="pt", padding=True).to(device, torch.bfloat16)
+
+    # Access the vision tower (CLIP ViT)
+    vision_tower = model.vision_tower
+
+    # Get pixel values and run through vision tower with attention output
+    pixel_values = inputs['pixel_values']
+
+    # Run vision tower forward pass with output_attentions
+    with torch.no_grad():
+        vision_outputs = vision_tower(pixel_values, output_attentions=True)
+
+    # Get attention from the last layer
+    # Shape: (batch, num_heads, seq_len, seq_len) where seq_len = num_patches + 1 (CLS)
+    last_layer_attention = vision_outputs.attentions[VIT_CLS_LAYER]
+
+    # Extract CLS token's attention to all patches (CLS is at position 0)
+    # Average across all attention heads
+    # Shape after indexing: (batch, num_heads, num_patches)
+    cls_attention = last_layer_attention[0, :, 0, 1:].mean(dim=0)  # Skip CLS attending to itself
+
+    # Reshape to 2D attention map
+    att_map = cls_attention.to(torch.float32).cpu().numpy().reshape(NUM_PATCHES, NUM_PATCHES)
+
+    return att_map
+
+
+def cls_attention_masked_llava(image, question, model, processor, prune_ratio=0.5):
+    """
+    Use CLS attention to create a masked image that removes low-importance regions.
+
+    This implements the "noise reduction" principle: MLLMs are noise-sensitive,
+    so removing irrelevant visual content improves accuracy.
+
+    Args:
+        image: Input PIL image
+        question: Question about the image
+        model: LLaVA model
+        processor: LLaVA processor
+        prune_ratio: Fraction of visual tokens to mask (0.5 = mask bottom 50%)
+
+    Returns:
+        dict with:
+            - att_map: CLS attention map
+            - masked_image: Image with low-attention regions masked
+            - keep_ratio: Actual ratio of tokens kept
+    """
+    from utils import create_masked_image
+
+    # Get CLS attention
+    att_map = cls_attention_llava(image, question, None, model, processor)
+
+    # Create masked image using the CLS attention
+    # Higher threshold = more aggressive masking
+    threshold_percentile = int(prune_ratio * 100)
+    masked_image = create_masked_image(image, att_map, threshold_percentile=threshold_percentile,
+                                        soft_mask=True, mask_style="black")
+
+    return {
+        "att_map": att_map,
+        "masked_image": masked_image,
+        "keep_ratio": 1.0 - prune_ratio
+    }

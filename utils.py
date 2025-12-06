@@ -1,12 +1,30 @@
-import torchvision.transforms.functional as TF
+"""
+Utility functions for attention-based visual cropping and masking.
+
+This module provides:
+1. Core functions (original paper): bbox_from_att_image_adaptive, high_res, high_pass_filter
+2. Attention-based masking: Mask out low-attention regions to reduce noise
+
+Key Insight: "MLLMs are noise-sensitive, not information-starved"
+- Multi-crop (adding more images) HURTS performance - adds noise/confusion
+- Masking irrelevant regions HELPS - reduces visual noise
+- Single focused crop WORKS - provides relevant detail without noise
+
+Reference: "MLLMs Know Where to Look" (ICLR 2025)
+"""
+
 import numpy as np
-import os
-from scipy.ndimage import median_filter, label, maximum_filter
+import base64
+from io import BytesIO
+
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+from PIL import Image as PILImage, ImageFilter
+from scipy.ndimage import median_filter, maximum_filter, gaussian_filter
+from scipy.stats import entropy as scipy_entropy
 from skimage.measure import block_reduce
 from qwen_vl_utils import process_vision_info
-from io import BytesIO
-import base64
-from scipy.stats import entropy as scipy_entropy
 
 def encode_base64(image):
     """
@@ -208,7 +226,7 @@ def high_res(map_func, image, prompt, general_prompt, model, processor):
 
 
 # =============================================================================
-# Smart Multi-Crop: Adaptive 0-N crop selection based on attention analysis
+# Attention Analysis: Helper functions for attention map analysis
 # =============================================================================
 
 def compute_attention_entropy(att_map):
@@ -240,115 +258,184 @@ def count_attention_peaks(att_map, min_distance=3, threshold_rel=0.3):
     return int(peaks.sum())
 
 
-def decide_num_crops(att_map, question=None, entropy_threshold=0.85, concentration_threshold=0.3, max_crops=4):
+def get_confidence_from_logits(logits):
     """
-    Decide how many crops to generate based on attention map analysis.
-    
+    Extract confidence score from model output logits.
+
+    Args:
+        logits: Model output logits for the first generated token
+
     Returns:
-        tuple: (num_crops, analysis_dict)
+        float: Confidence score (probability of top prediction)
     """
-    entropy = compute_attention_entropy(att_map)
-    concentration = compute_attention_concentration(att_map)
-    num_peaks = count_attention_peaks(att_map)
-    
-    # Question-based adjustment
-    question_boost = 0
-    if question:
-        q_lower = question.lower()
-        if any(w in q_lower for w in ['how many', 'count', 'number of', 'total']):
-            question_boost = 1
-        elif any(w in q_lower for w in ['difference', 'compare', 'between', 'both', 'all']):
-            question_boost = 1
-    
-    # Decision logic
-    if entropy > entropy_threshold:
-        num_crops = 0
-        reason = "entropy_too_high"
-    elif concentration > 0.7 and num_peaks == 1:
-        num_crops = 1
-        reason = "single_focused_region"
-    elif num_peaks >= 2:
-        num_crops = min(num_peaks, max_crops) + question_boost
-        reason = "multiple_salient_peaks"
-    elif concentration > concentration_threshold:
-        num_crops = 1 + question_boost
-        reason = "moderate_concentration"
+    # Get softmax probabilities
+    probs = F.softmax(logits, dim=-1)
+    # Confidence is the max probability
+    confidence = probs.max().item()
+
+    return confidence
+
+
+# =============================================================================
+# Attention-based Masking: Mask out low-attention regions instead of multi-crop
+# =============================================================================
+
+def create_attention_mask(att_map, threshold_percentile=50, soft_mask=True, blur_kernel=3):
+    """
+    Create a mask from attention map to highlight relevant regions.
+
+    Args:
+        att_map: 2D attention map (e.g., 24x24 for LLaVA)
+        threshold_percentile: Percentile threshold for masking (regions below this are masked)
+        soft_mask: If True, create a soft mask with gradual falloff. If False, binary mask.
+        blur_kernel: Kernel size for Gaussian blur (soft mask smoothing)
+
+    Returns:
+        mask: 2D numpy array (same size as att_map), values in [0, 1]
+              1 = keep (high attention), 0 = mask out (low attention)
+    """
+    # Normalize attention to [0, 1]
+    att_norm = att_map - att_map.min()
+    if att_norm.max() > 0:
+        att_norm = att_norm / att_norm.max()
+
+    if soft_mask:
+        # Soft mask: use normalized attention directly with smoothing
+        mask = gaussian_filter(att_norm, sigma=blur_kernel / 2)
+        # Enhance contrast: stretch values above threshold
+        threshold = np.percentile(mask, threshold_percentile)
+        mask = np.clip((mask - threshold * 0.5) / (1 - threshold * 0.5), 0, 1)
     else:
-        num_crops = 0
-        reason = "attention_too_diffuse"
-    
-    num_crops = min(num_crops, max_crops)
-    
-    analysis = {
-        "entropy": float(entropy),
-        "entropy_threshold": float(entropy_threshold),
-        "concentration": float(concentration),
-        "num_peaks": int(num_peaks),
-        "question_boost": int(question_boost),
-        "decision_reason": reason
-    }
-    return num_crops, analysis
+        # Binary mask: threshold at percentile
+        threshold = np.percentile(att_norm, threshold_percentile)
+        mask = (att_norm > threshold).astype(np.float32)
+
+    return mask
 
 
-def get_multi_crop_bboxes(att_map, image_size, num_crops, bbox_size=224):
+def apply_mask_to_image(image, mask, mask_color=(0, 0, 0), mask_alpha=0.8):
     """
-    Generate multiple bounding boxes from attention map peaks.
-    
-    Returns list of (bbox, score) tuples sorted by attention strength.
+    Apply attention mask to image, dimming/blacking out low-attention regions.
+
+    Args:
+        image: PIL Image
+        mask: 2D numpy array (attention-based mask), values in [0, 1]
+        mask_color: RGB tuple for masked regions (default: black)
+        mask_alpha: How much to blend mask color (1.0 = full mask, 0.0 = no effect)
+
+    Returns:
+        masked_image: PIL Image with low-attention regions masked
     """
-    if num_crops <= 0:
-        return []
-    
-    bboxes_with_scores = []
-    att_remaining = att_map.copy()
-    block_size = (image_size[0] / att_map.shape[1], image_size[1] / att_map.shape[0])
-    
-    for _ in range(num_crops):
-        if att_remaining.max() <= 0:
-            break
-            
-        # Find best bbox using existing adaptive method logic
-        bbox = bbox_from_att_image_adaptive(att_remaining, image_size, bbox_size)
-        # Convert to native Python types for JSON serialization
-        bbox = tuple(int(x) for x in bbox)
-        
-        # Calculate score for this region
-        x1_idx = int(bbox[0] / block_size[0])
-        y1_idx = int(bbox[1] / block_size[1])
-        x2_idx = min(int(bbox[2] / block_size[0]), att_map.shape[1])
-        y2_idx = min(int(bbox[3] / block_size[1]), att_map.shape[0])
-        
-        if x2_idx > x1_idx and y2_idx > y1_idx:
-            region = att_remaining[y1_idx:y2_idx, x1_idx:x2_idx]
-            score = float(region.mean()) if region.size > 0 else 0.0
-            bboxes_with_scores.append((bbox, score))
-            # Suppress this region for next iteration
-            att_remaining[y1_idx:y2_idx, x1_idx:x2_idx] = 0
-    
-    return bboxes_with_scores
+    # Resize mask to image size
+    mask_resized = np.array(
+        PILImage.fromarray((mask * 255).astype(np.uint8)).resize(
+            image.size, resample=PILImage.BILINEAR
+        )
+    ) / 255.0
+
+    # Convert image to numpy
+    img_array = np.array(image).astype(np.float32)
+
+    # Create mask color array
+    mask_color_array = np.array(mask_color, dtype=np.float32)
+
+    # Apply mask: blend between original and mask_color based on mask value
+    # High mask value (1) = keep original, low mask value (0) = show mask_color
+    for c in range(3):
+        img_array[:, :, c] = (
+            mask_resized * img_array[:, :, c] +
+            (1 - mask_resized) * mask_alpha * mask_color_array[c] +
+            (1 - mask_resized) * (1 - mask_alpha) * img_array[:, :, c]
+        )
+
+    return PILImage.fromarray(img_array.astype(np.uint8))
 
 
-def smart_multi_crop(att_map, image_size, bbox_size=224, question=None, max_crops=4):
+def create_masked_image(image, att_map, threshold_percentile=40, soft_mask=True,
+                        mask_style="black"):
     """
-    Main entry point for smart multi-crop.
-    
+    Main function to create a masked version of image based on attention.
+
+    This is used for the "original + masked" approach:
+    - Instead of adding multiple crop images (confusing)
+    - Add ONE masked image where irrelevant regions are dimmed/hidden
+
+    Args:
+        image: PIL Image (original)
+        att_map: 2D attention map from rel_attention or similar
+        threshold_percentile: Regions below this percentile get masked
+        soft_mask: Use soft (gradual) or hard (binary) masking
+        mask_style: "black" (black out), "blur" (blur out), or "dim" (darken)
+
+    Returns:
+        masked_image: PIL Image with irrelevant regions masked
+    """
+    # Create the attention mask
+    mask = create_attention_mask(att_map, threshold_percentile, soft_mask)
+
+    if mask_style == "black":
+        # Black out low-attention regions
+        masked_image = apply_mask_to_image(image, mask, mask_color=(0, 0, 0), mask_alpha=1.0)
+
+    elif mask_style == "blur":
+        # Blur low-attention regions (keep them visible but unfocused)
+        blurred = image.filter(ImageFilter.GaussianBlur(radius=15))
+        blurred_array = np.array(blurred).astype(np.float32)
+        original_array = np.array(image).astype(np.float32)
+
+        # Resize mask
+        mask_resized = np.array(
+            PILImage.fromarray((mask * 255).astype(np.uint8)).resize(
+                image.size, resample=PILImage.BILINEAR
+            )
+        ) / 255.0
+
+        # Blend: high attention = original, low attention = blurred
+        result = np.zeros_like(original_array)
+        for c in range(3):
+            result[:, :, c] = (
+                mask_resized * original_array[:, :, c] +
+                (1 - mask_resized) * blurred_array[:, :, c]
+            )
+        masked_image = PILImage.fromarray(result.astype(np.uint8))
+
+    elif mask_style == "dim":
+        # Dim/darken low-attention regions
+        masked_image = apply_mask_to_image(image, mask, mask_color=(0, 0, 0), mask_alpha=0.7)
+
+    else:
+        raise ValueError(f"Unknown mask_style: {mask_style}")
+
+    return masked_image
+
+
+def should_use_masking(att_map, entropy_threshold=0.75):
+    """
+    Decide whether masking would be beneficial based on attention distribution.
+
+    Returns True if attention is focused enough that masking would help.
+    Returns False if attention is too diffuse (masking wouldn't help).
+
     Args:
         att_map: 2D attention map
-        image_size: (width, height) of original image
-        bbox_size: Base size for crops
-        question: Optional question text for context-aware decisions
-        max_crops: Maximum number of crops to generate
-        
+        entropy_threshold: If entropy > this, attention too diffuse for masking
+
     Returns:
-        tuple: (list of bboxes, analysis dict)
+        tuple: (should_mask: bool, analysis: dict)
     """
-    num_crops, analysis = decide_num_crops(att_map, question=question, max_crops=max_crops)
-    
-    if num_crops == 0:
-        return [], analysis
-    
-    bboxes_with_scores = get_multi_crop_bboxes(att_map, image_size, num_crops, bbox_size)
-    bboxes = [bbox for bbox, _ in bboxes_with_scores]
-    analysis["crop_scores"] = [float(score) for _, score in bboxes_with_scores]
-    
-    return bboxes, analysis
+    entropy = compute_attention_entropy(att_map)
+    concentration = compute_attention_concentration(att_map, top_k_percent=20)
+    num_peaks = count_attention_peaks(att_map)
+
+    # Decision: mask if attention is reasonably focused
+    should_mask = entropy < entropy_threshold and concentration > 0.25
+
+    analysis = {
+        "entropy": float(entropy),
+        "concentration": float(concentration),
+        "num_peaks": int(num_peaks),
+        "should_mask": should_mask,
+        "reason": "focused_attention" if should_mask else "diffuse_attention"
+    }
+
+    return should_mask, analysis

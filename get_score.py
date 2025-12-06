@@ -65,7 +65,15 @@ def process_text(text):
     text = process_digit_article(text)
     return text
 
+def parse_labels(labels):
+    """Parse labels that might be stored as string representation of list."""
+    if isinstance(labels, str) and labels.startswith('['):
+        import ast
+        return ast.literal_eval(labels)
+    return labels
+
 def get_acc(pred, gts):
+    gts = parse_labels(gts)
     pred = process_text(pred)
     gts = [process_text(gt) for gt in gts]
     same_num = sum([1 if pred == gt else 0 for gt in gts])
@@ -73,6 +81,7 @@ def get_acc(pred, gts):
     return 100 * min(0.3 * same_num, 1)
 
 def get_acc_gqa(pred, gts):
+    gts = parse_labels(gts)
     pred = process_text(pred)
     gts = [process_text(gt) for gt in gts]
     same_num = sum([1 if gt in pred else 0 for gt in gts])
